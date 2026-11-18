@@ -4,7 +4,6 @@ import dotenv from "dotenv";
 import dns from "node:dns";
 import { MongoClient, ObjectId } from "mongodb";
 import { Resend } from "resend";
-import Stripe from "stripe";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import {
@@ -77,26 +76,16 @@ app.use(cors({
     allowedHeaders: [
         "Content-Type",
         "Authorization",
-        "x-admin-setup-secret",
-        "stripe-signature"
+        "x-admin-setup-secret"
     ]
 }));
 
 app.use(express.json({
-    limit: "20kb",
-    verify: (req, res, buffer) => {
-        if (req.originalUrl === "/api/stripe/webhook") {
-            req.rawBody = Buffer.from(buffer);
-        }
-    }
+    limit: "20kb"
 }));
 
 
 const resend = new Resend(process.env.RESEND_API_KEY);
-
-const stripe = process.env.STRIPE_SECRET_KEY
-    ? new Stripe(process.env.STRIPE_SECRET_KEY)
-    : null;
 
 const membershipPlans = {
     basic: {
@@ -202,22 +191,6 @@ const initializeDatabase = async () => {
         {
             key: { purchasedAt: -1 },
             name: "recent_purchases_index"
-        },
-        {
-            key: { stripeSessionId: 1 },
-            name: "unique_stripe_session_id",
-            unique: true,
-            partialFilterExpression: {
-                stripeSessionId: { $type: "string" }
-            }
-        },
-        {
-            key: { stripePaymentIntentId: 1 },
-            name: "unique_stripe_payment_intent",
-            unique: true,
-            partialFilterExpression: {
-                stripePaymentIntentId: { $type: "string" }
-            }
         }
     ]);
 
@@ -386,11 +359,6 @@ const sendOTPLimiter = createRateLimiter(
 );
 
 const verifyOTPLimiter = createRateLimiter(
-    10,
-    15 * 60 * 1000
-);
-
-const checkoutLimiter = createRateLimiter(
     10,
     15 * 60 * 1000
 );
@@ -719,7 +687,10 @@ app.get("/api/admin/me", verifyAdmin, async (req, res) => {
 // CUSTOMER REGISTRATION
 // ==========================================
 
+
 app.post("/api/members/register", registrationLimiter, async (req, res) => {
+    const session = client.startSession();
+
     try {
         const {
             fullName,
@@ -730,7 +701,7 @@ app.post("/api/members/register", registrationLimiter, async (req, res) => {
             terms
         } = req.body;
 
-
+        // Validate required fields
         if (
             typeof fullName !== "string" ||
             typeof email !== "string" ||
@@ -761,7 +732,6 @@ app.post("/api/members/register", registrationLimiter, async (req, res) => {
             });
         }
 
-
         const normalizedEmail = email.trim().toLowerCase();
         const normalizedPlan = membership.trim().toLowerCase();
 
@@ -772,13 +742,16 @@ app.post("/api/members/register", registrationLimiter, async (req, res) => {
             });
         }
 
-        if (!membershipPlans[normalizedPlan]) {
+        const plan = membershipPlans[normalizedPlan];
+
+        if (!plan) {
             return res.status(400).json({
                 success: false,
                 message: "Invalid membership plan."
             });
         }
 
+        // Validate date of birth
         const dob = /^\d{4}-\d{2}-\d{2}$/.test(dateOfBirth)
             ? new Date(`${dateOfBirth}T00:00:00.000Z`)
             : null;
@@ -795,7 +768,11 @@ app.post("/api/members/register", registrationLimiter, async (req, res) => {
             });
         }
 
-        const existingMember = await db.collection("members").findOne({
+        const members = db.collection("members");
+        const purchases = db.collection("purchases");
+
+        // Check whether this email is already registered
+        const existingMember = await members.findOne({
             email: normalizedEmail
         });
 
@@ -803,21 +780,56 @@ app.post("/api/members/register", registrationLimiter, async (req, res) => {
             return res.status(409).json({
                 success: false,
                 code: "EXISTING_MEMBER",
-                message: "An account with this email already exists. Please verify your email to continue."
+                message: "An account with this email already exists. Please contact the club if you need assistance."
             });
         }
 
-        const plan = membershipPlans[normalizedPlan];
         const now = new Date();
 
-        const purchase = {
-            memberId: null,
+        // Activate membership immediately
+        const startDate = now;
+        const expiryDate = addCalendarMonths(
+            startDate,
+            plan.durationMonths
+        );
+
+        // Generate secure membership card access token
+        const cardToken = randomBytes(32).toString("hex");
+        const cardTokenHash = hashToken(cardToken);
+
+        const memberId = generateMemberId();
+
+        const newMember = {
+            memberId,
+
+            accessTokenHash: cardTokenHash,
+            cardAccessTokenHashes: [cardTokenHash],
+
+            fullName: fullName.trim(),
+            email: normalizedEmail,
+            phone: phone.trim(),
+            dateOfBirth: dob,
+
+            membershipType: normalizedPlan,
+            membershipStartDate: startDate,
+            expiryDate,
+
+            status: "active",
+
+            createdAt: now,
+            updatedAt: now
+        };
+
+        // Keep a registration record for admin history.
+        // No online payment is processed or confirmed here.
+        const purchaseRecord = {
+            memberId,
 
             customer: {
-                fullName: fullName.trim(),
-                email: normalizedEmail,
-                phone: phone.trim(),
-                dateOfBirth: dob
+                fullName: newMember.fullName,
+                email: newMember.email,
+                phone: newMember.phone,
+                dateOfBirth: newMember.dateOfBirth
             },
 
             plan: normalizedPlan,
@@ -825,41 +837,229 @@ app.post("/api/members/register", registrationLimiter, async (req, res) => {
             currency: plan.currency,
             durationMonths: plan.durationMonths,
 
-            paymentStatus: "pending",
-            paymentGateway: "stripe",
-
-            stripeSessionId: null,
-            stripePaymentIntentId: null,
+            purchaseType: "registration",
+            paymentStatus: "offline",
+            paymentGateway: "offline",
 
             purchasedAt: now,
-            membershipStartDate: null,
-            membershipExpiryDate: null,
+            membershipStartDate: startDate,
+            membershipExpiryDate: expiryDate,
+
+            membershipActivatedAt: now,
+            membershipActivationStatus: "completed",
 
             createdAt: now,
             updatedAt: now
         };
 
-        const result = await db.collection("purchases").insertOne(purchase);
+        // Save member and registration history together
+        await session.withTransaction(async () => {
+            await members.insertOne(newMember, { session });
+
+            await purchases.insertOne(purchaseRecord, { session });
+        });
+
+        // Create the membership card URL
+        const cardUrl = `${FRONTEND_URL}/member/${cardToken}`;
+
+        const escapeHTML = (value) =>
+            String(value ?? "").replace(
+                /[&<>"']/g,
+                (character) => ({
+                    "&": "&amp;",
+                    "<": "&lt;",
+                    ">": "&gt;",
+                    '"': "&quot;",
+                    "'": "&#39;"
+                })[character]
+            );
+
+        const formattedExpiry = expiryDate.toDateString();
+
+        const formattedAmount =
+            `$${(plan.amount / 100).toFixed(2)}`;
+
+        // Send welcome email after the database transaction commits
+        let emailSent = false;
+
+        try {
+            const emailResult = await resend.emails.send({
+                from: process.env.EMAIL_FROM,
+                to: normalizedEmail,
+                subject: "Welcome to DA WEB SOCIAL CLUB",
+
+                html: `
+                    <div style="
+                        background:#080808;
+                        color:#ffffff;
+                        padding:35px 20px;
+                        font-family:Arial,sans-serif;
+                        text-align:center;
+                    ">
+                        <h1 style="
+                            color:#d4af37;
+                            margin-bottom:25px;
+                        ">
+                            Welcome to DA WEB SOCIAL CLUB
+                        </h1>
+
+                        <p style="color:#dddddd;">
+                            Hello ${escapeHTML(newMember.fullName)},
+                        </p>
+
+                        <p style="
+                            color:#dddddd;
+                            line-height:1.7;
+                        ">
+                            Congratulations! Your registration is complete
+                            and your membership has been activated.
+                        </p>
+
+                        <div style="
+                            background:#151515;
+                            border:1px solid #444;
+                            border-radius:10px;
+                            padding:25px;
+                            margin:25px auto;
+                            max-width:420px;
+                            text-align:left;
+                        ">
+                            <p>
+                                <span style="color:#aaaaaa;">
+                                    Member ID:
+                                </span>
+                                <strong>
+                                    ${escapeHTML(memberId)}
+                                </strong>
+                            </p>
+
+                            <p>
+                                <span style="color:#aaaaaa;">
+                                    Membership:
+                                </span>
+                                <strong style="color:#d4af37;">
+                                    ${escapeHTML(plan.name)}
+                                </strong>
+                            </p>
+
+                            <p>
+                                <span style="color:#aaaaaa;">
+                                    Membership Fee:
+                                </span>
+                                <strong>
+                                    ${formattedAmount}
+                                </strong>
+                            </p>
+
+                            <p>
+                                <span style="color:#aaaaaa;">
+                                    Membership Status:
+                                </span>
+                                <strong style="color:#4ade80;">
+                                    ACTIVE
+                                </strong>
+                            </p>
+
+                            <p>
+                                <span style="color:#aaaaaa;">
+                                    Membership Expiry:
+                                </span>
+                                <strong>
+                                    ${escapeHTML(formattedExpiry)}
+                                </strong>
+                            </p>
+                        </div>
+
+                        <a
+                            href="${cardUrl}"
+                            style="
+                                display:inline-block;
+                                padding:14px 28px;
+                                background:#d4af37;
+                                color:#080808;
+                                text-decoration:none;
+                                font-weight:bold;
+                                border-radius:5px;
+                                margin-top:10px;
+                            "
+                        >
+                            VIEW YOUR MEMBERSHIP CARD
+                        </a>
+
+                        <p style="
+                            color:#999999;
+                            font-size:13px;
+                            line-height:1.6;
+                            margin-top:25px;
+                        ">
+                            Please keep this email safe.
+                            You can use the link above to access
+                            your digital membership card.
+                        </p>
+
+                        <p style="
+                            color:#888888;
+                            font-size:12px;
+                            margin-top:35px;
+                        ">
+                            DA WEB SOCIAL CLUB
+                        </p>
+                    </div>
+                `
+            });
+
+            if (emailResult.error) {
+                console.error(
+                    "Registration email failed:",
+                    emailResult.error
+                );
+            } else {
+                emailSent = true;
+                console.log(
+                    `Welcome email sent to ${normalizedEmail}`
+                );
+            }
+
+        } catch (emailError) {
+            console.error(
+                "Registration completed, but welcome email failed:",
+                emailError
+            );
+        }
 
         return res.status(201).json({
             success: true,
-            message: "Registration information saved successfully.",
-            purchaseId: result.insertedId,
-            plan: plan.name,
-            amount: plan.amount,
-            currency: plan.currency,
-            durationMonths: plan.durationMonths
+            message: emailSent
+                ? "Registration completed successfully! Your membership is active. Please check your email for your membership card."
+                : "Registration completed and membership activated, but we could not send your email. Please contact the club.",
+            memberId,
+            membership: plan.name,
+            membershipStatus: "active",
+            cardUrl,
+            emailSent
         });
 
     } catch (error) {
         console.error("Registration error:", error);
 
+        if (error.code === 11000) {
+            return res.status(409).json({
+                success: false,
+                code: "EXISTING_MEMBER",
+                message: "An account with this email or member ID already exists."
+            });
+        }
+
         return res.status(500).json({
             success: false,
             message: "Unable to complete registration."
         });
+
+    } finally {
+        await session.endSession();
     }
 });
+
 
 // ==========================================
 // SEND OTP
@@ -1100,6 +1300,7 @@ app.post("/api/members/verify-otp", verifyOTPLimiter, async (req, res) => {
 // CREATE RENEWAL PURCHASE
 // ==========================================
 
+
 app.post("/api/members/renewal-purchase", renewalLimiter, async (req, res) => {
     const { verificationToken, membership } = req.body;
 
@@ -1125,12 +1326,17 @@ app.post("/api/members/renewal-purchase", renewalLimiter, async (req, res) => {
 
     const session = client.startSession();
 
-    try {
-        let renewalPurchase = null;
+    // Generate a new secure card token for this renewal.
+    const cardToken = randomBytes(32).toString("hex");
+    const cardTokenHash = hashToken(cardToken);
 
+    let renewalResult = null;
+
+    try {
         await session.withTransaction(async () => {
             const now = new Date();
             const tokenHash = hashToken(verificationToken);
+
             const otps = db.collection("otps");
             const members = db.collection("members");
             const purchases = db.collection("purchases");
@@ -1174,6 +1380,25 @@ app.post("/api/members/renewal-purchase", renewalLimiter, async (req, res) => {
                 throw error;
             }
 
+            // If the current membership has not expired, extend it.
+            // Otherwise, start the renewed membership today.
+            const existingExpiry = member.expiryDate
+                ? new Date(member.expiryDate)
+                : null;
+
+            const startDate =
+                existingExpiry &&
+                    !Number.isNaN(existingExpiry.getTime()) &&
+                    existingExpiry > now
+                    ? existingExpiry
+                    : now;
+
+            const expiryDate = addCalendarMonths(
+                startDate,
+                plan.durationMonths
+            );
+
+            // Consume the verified OTP.
             const consumeResult = await otps.updateOne(
                 {
                     _id: otpRecord._id,
@@ -1197,6 +1422,29 @@ app.post("/api/members/renewal-purchase", renewalLimiter, async (req, res) => {
                 throw error;
             }
 
+            // Activate the renewed membership and preserve old card links.
+            const updateResult = await members.updateOne(
+                { _id: member._id },
+                {
+                    $set: {
+                        membershipType: normalizedPlan,
+                        membershipStartDate: startDate,
+                        expiryDate,
+                        status: "active",
+                        updatedAt: now
+                    },
+                    $addToSet: {
+                        cardAccessTokenHashes: cardTokenHash
+                    }
+                },
+                { session }
+            );
+
+            if (updateResult.modifiedCount !== 1) {
+                throw new Error("Unable to update the membership.");
+            }
+
+            // Record the renewal as an offline transaction.
             const purchase = {
                 memberId: member.memberId,
 
@@ -1213,913 +1461,193 @@ app.post("/api/members/renewal-purchase", renewalLimiter, async (req, res) => {
                 durationMonths: plan.durationMonths,
 
                 purchaseType: "renewal",
-                paymentStatus: "pending",
-                paymentGateway: "stripe",
-
-                stripeSessionId: null,
-                stripePaymentIntentId: null,
+                paymentStatus: "offline",
+                paymentGateway: "offline",
 
                 purchasedAt: now,
-                membershipStartDate: null,
-                membershipExpiryDate: null,
+                membershipStartDate: startDate,
+                membershipExpiryDate: expiryDate,
+                membershipActivatedAt: now,
+                membershipActivationStatus: "completed",
 
                 createdAt: now,
                 updatedAt: now
             };
 
-            const result = await purchases.insertOne(purchase, { session });
+            await purchases.insertOne(purchase, { session });
 
-            renewalPurchase = {
-                purchaseId: result.insertedId,
+            renewalResult = {
                 memberId: member.memberId,
+                fullName: member.fullName,
+                email: member.email,
                 plan: plan.name,
                 amount: plan.amount,
-                currency: plan.currency,
-                durationMonths: plan.durationMonths
+                expiryDate,
+                cardUrl: `${FRONTEND_URL}/member/${cardToken}`
             };
         });
 
+        // Send renewal confirmation after the database transaction succeeds.
+        const escapeHTML = (value) =>
+            String(value ?? "").replace(
+                /[&<>"']/g,
+                (character) => ({
+                    "&": "&amp;",
+                    "<": "&lt;",
+                    ">": "&gt;",
+                    '"': "&quot;",
+                    "'": "&#39;"
+                })[character]
+            );
+
+        const formattedExpiry = renewalResult.expiryDate.toDateString();
+        const formattedAmount = `$${(renewalResult.amount / 100).toFixed(2)}`;
+
+        let emailSent = false;
+
+        try {
+            const emailResult = await resend.emails.send({
+                from: process.env.EMAIL_FROM,
+                to: renewalResult.email,
+                subject: "Your DA WEB SOCIAL CLUB Membership Has Been Renewed",
+                html: `
+                    <div style="
+                        background:#080808;
+                        color:#ffffff;
+                        padding:35px 20px;
+                        font-family:Arial,sans-serif;
+                        text-align:center;
+                    ">
+                        <h1 style="color:#d4af37;margin-bottom:25px;">
+                            Membership Renewed!
+                        </h1>
+
+                        <p style="color:#dddddd;">
+                            Hello ${escapeHTML(renewalResult.fullName)},
+                        </p>
+
+                        <p style="color:#dddddd;line-height:1.7;">
+                            Your membership renewal is complete and your
+                            membership has been activated successfully.
+                        </p>
+
+                        <div style="
+                            background:#151515;
+                            border:1px solid #444;
+                            border-radius:10px;
+                            padding:25px;
+                            margin:25px auto;
+                            max-width:420px;
+                            text-align:left;
+                        ">
+                            <p>
+                                <span style="color:#aaaaaa;">Member ID:</span>
+                                <strong>${escapeHTML(renewalResult.memberId)}</strong>
+                            </p>
+
+                            <p>
+                                <span style="color:#aaaaaa;">Membership:</span>
+                                <strong style="color:#d4af37;">
+                                    ${escapeHTML(renewalResult.plan)}
+                                </strong>
+                            </p>
+
+                            <p>
+                                <span style="color:#aaaaaa;">Membership Fee:</span>
+                                <strong>${formattedAmount}</strong>
+                            </p>
+
+                            <p>
+                                <span style="color:#aaaaaa;">Membership Status:</span>
+                                <strong style="color:#4ade80;">ACTIVE</strong>
+                            </p>
+
+                            <p>
+                                <span style="color:#aaaaaa;">New Expiry Date:</span>
+                                <strong>${escapeHTML(formattedExpiry)}</strong>
+                            </p>
+                        </div>
+
+                        <a href="${renewalResult.cardUrl}" style="
+                            display:inline-block;
+                            padding:14px 28px;
+                            background:#d4af37;
+                            color:#080808;
+                            text-decoration:none;
+                            font-weight:bold;
+                            border-radius:5px;
+                            margin-top:10px;
+                        ">
+                            VIEW YOUR MEMBERSHIP CARD
+                        </a>
+
+                        <p style="
+                            color:#999999;
+                            font-size:13px;
+                            line-height:1.6;
+                            margin-top:25px;
+                        ">
+                            Please keep this email safe.
+                            You can use the link above to access
+                            your updated digital membership card.
+                        </p>
+
+                        <p style="
+                            color:#888888;
+                            font-size:12px;
+                            margin-top:35px;
+                        ">
+                            DA WEB SOCIAL CLUB
+                        </p>
+                    </div>
+                `
+            });
+
+            if (emailResult.error) {
+                console.error(
+                    "Renewal email failed:",
+                    emailResult.error
+                );
+            } else {
+                emailSent = true;
+                console.log(
+                    `Renewal confirmation email sent to ${renewalResult.email}`
+                );
+            }
+        } catch (emailError) {
+            console.error(
+                "Renewal completed, but email failed:",
+                emailError
+            );
+        }
+
         return res.status(201).json({
             success: true,
-            message: "Renewal purchase created successfully. Continue to payment.",
-            ...renewalPurchase
+            message: emailSent
+                ? "Your membership has been renewed and activated successfully. Please check your email for your updated membership card."
+                : "Your membership has been renewed and activated, but we could not send your email. Please contact the club.",
+            memberId: renewalResult.memberId,
+            membership: renewalResult.plan,
+            membershipStatus: "active",
+            cardUrl: renewalResult.cardUrl,
+            expiryDate: renewalResult.expiryDate,
+            emailSent
         });
 
     } catch (error) {
-        console.error("Renewal purchase error:", error);
+        console.error("Renewal error:", error);
 
         return res.status(error.statusCode || 500).json({
             success: false,
             message: error.statusCode
                 ? error.message
-                : "Unable to create renewal purchase."
+                : "Unable to complete membership renewal."
         });
 
     } finally {
         await session.endSession();
     }
 });
-
-// ==========================================
-// STRIPE CHECKOUT
-// ==========================================
-
-
-app.post("/api/payments/create-checkout-session", checkoutLimiter, async (req, res) => {
-    try {
-        if (!stripe) {
-            return res.status(503).json({
-                success: false,
-                message: "Stripe is not configured yet."
-            });
-        }
-
-        const { purchaseId } = req.body;
-
-        if (
-            typeof purchaseId !== "string" ||
-            !ObjectId.isValid(purchaseId)
-        ) {
-            return res.status(400).json({
-                success: false,
-                message: "Invalid purchase ID."
-            });
-        }
-
-        const purchases = db.collection("purchases");
-
-        const purchase = await purchases.findOne({
-            _id: new ObjectId(purchaseId),
-            paymentStatus: "pending"
-        });
-
-        if (!purchase) {
-            return res.status(404).json({
-                success: false,
-                message: "Pending purchase not found."
-            });
-        }
-
-        const plan = membershipPlans[purchase.plan];
-
-        if (
-            !plan ||
-            purchase.amount !== plan.amount ||
-            purchase.currency !== plan.currency
-        ) {
-            return res.status(400).json({
-                success: false,
-                message: "Invalid purchase details."
-            });
-        }
-
-        // Reuse an existing Stripe Checkout Session if possible.
-        let idempotencyKey = `checkout-${purchase._id}-initial`;
-
-        if (purchase.stripeSessionId) {
-            const existingSession =
-                await stripe.checkout.sessions.retrieve(
-                    purchase.stripeSessionId
-                );
-
-            if (
-                existingSession.status === "open" &&
-                existingSession.url
-            ) {
-                return res.json({
-                    success: true,
-                    checkoutUrl: existingSession.url
-                });
-            }
-
-            if (existingSession.status === "complete") {
-                return res.status(409).json({
-                    success: false,
-                    message: "This checkout session has already been completed or is processing."
-                });
-            }
-
-            if (existingSession.status !== "expired") {
-                return res.status(409).json({
-                    success: false,
-                    message: "Unable to create another checkout session for this purchase."
-                });
-            }
-
-            // Use the expired session ID to create a new,
-            // consistent idempotency key for this retry.
-            idempotencyKey =
-                `checkout-${purchase._id}-${existingSession.id}`;
-        }
-
-        const stripeSession = await stripe.checkout.sessions.create(
-            {
-                mode: "payment",
-
-                customer_email: purchase.customer.email,
-
-                line_items: [
-                    {
-                        price_data: {
-                            currency: purchase.currency,
-                            unit_amount: purchase.amount,
-                            product_data: {
-                                name: `${plan.name} Membership`,
-                                description: `${plan.durationMonths} month membership`
-                            }
-                        },
-                        quantity: 1
-                    }
-                ],
-
-                metadata: {
-                    purchaseId: purchase._id.toString()
-                },
-
-                payment_intent_data: {
-                    metadata: {
-                        purchaseId: purchase._id.toString()
-                    }
-                },
-
-                success_url: `${FRONTEND_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
-
-                cancel_url: `${FRONTEND_URL}/payment/cancelled`
-            },
-            {
-                idempotencyKey
-            }
-        );
-
-        if (!stripeSession.url) {
-            return res.status(500).json({
-                success: false,
-                message: "Stripe did not return a checkout URL."
-            });
-        }
-
-        const updateResult = await purchases.updateOne(
-            {
-                _id: purchase._id,
-                paymentStatus: "pending"
-            },
-            {
-                $set: {
-                    stripeSessionId: stripeSession.id,
-                    updatedAt: new Date()
-                }
-            }
-        );
-
-        if (updateResult.modifiedCount !== 1) {
-            const latestPurchase = await purchases.findOne({
-                _id: purchase._id
-            });
-
-            if (
-                !latestPurchase ||
-                latestPurchase.paymentStatus !== "pending"
-            ) {
-                return res.status(409).json({
-                    success: false,
-                    message: "This purchase is no longer pending."
-                });
-            }
-
-            if (latestPurchase.stripeSessionId !== stripeSession.id) {
-                return res.status(409).json({
-                    success: false,
-                    message: "The checkout session changed. Please try again."
-                });
-            }
-        }
-
-        return res.json({
-            success: true,
-            checkoutUrl: stripeSession.url
-        });
-
-    } catch (error) {
-        console.error("Stripe checkout error:", error);
-
-        return res.status(500).json({
-            success: false,
-            message: "Unable to create checkout session."
-        });
-    }
-});
-
-
-// ==========================================
-// ACTIVATE VERIFIED PAID PURCHASE
-// ==========================================
-
-
-const activatePaidPurchase = async (purchaseId) => {
-    if (
-        typeof purchaseId !== "string" ||
-        !ObjectId.isValid(purchaseId)
-    ) {
-        throw new Error("Invalid purchase ID.");
-    }
-
-    const session = client.startSession();
-
-    let activationResult = null;
-    let membershipEmail = null;
-
-    try {
-        await session.withTransaction(async () => {
-            const purchases = db.collection("purchases");
-            const members = db.collection("members");
-
-            const purchase = await purchases.findOne(
-                {
-                    _id: new ObjectId(purchaseId),
-                    paymentStatus: "paid"
-                },
-                { session }
-            );
-
-            if (!purchase) {
-                throw new Error("Verified paid purchase not found.");
-            }
-
-            // Prevent duplicate activation and duplicate emails
-            // when Stripe sends the same webhook more than once.
-            if (
-                purchase.membershipActivatedAt ||
-                purchase.membershipActivationStatus === "completed"
-            ) {
-                activationResult = {
-                    success: true,
-                    message: "Membership already activated.",
-                    memberId: purchase.memberId
-                };
-
-                return;
-            }
-
-            const plan = membershipPlans[purchase.plan];
-
-            if (
-                !plan ||
-                purchase.amount !== plan.amount ||
-                purchase.currency !== plan.currency
-            ) {
-                throw new Error("Purchase plan validation failed.");
-            }
-
-            let member = await members.findOne(
-                { email: purchase.customer.email },
-                { session }
-            );
-
-            const isNewMember = !member;
-            const now = new Date();
-
-            const startDate =
-                member?.expiryDate && member.expiryDate > now
-                    ? member.expiryDate
-                    : now;
-
-            const expiryDate = addCalendarMonths(
-                startDate,
-                plan.durationMonths
-            );
-
-            // Generate a new secure card link for this email.
-            const cardToken = randomBytes(32).toString("hex");
-            const cardTokenHash = hashToken(cardToken);
-
-            if (isNewMember) {
-                const newMember = {
-                    memberId: generateMemberId(),
-
-                    // Preserve the original token field.
-                    accessTokenHash: cardTokenHash,
-
-                    // Keep all card token hashes so previous links
-                    // continue working after future renewals.
-                    cardAccessTokenHashes: [cardTokenHash],
-
-                    fullName: purchase.customer.fullName,
-                    email: purchase.customer.email,
-                    phone: purchase.customer.phone,
-                    dateOfBirth: purchase.customer.dateOfBirth,
-
-                    membershipType: purchase.plan,
-                    membershipStartDate: startDate,
-                    expiryDate,
-
-                    status: "active",
-
-                    createdAt: now,
-                    updatedAt: now
-                };
-
-                const result = await members.insertOne(
-                    newMember,
-                    { session }
-                );
-
-                member = {
-                    ...newMember,
-                    _id: result.insertedId
-                };
-
-            } else {
-                const memberUpdate = await members.updateOne(
-                    { _id: member._id },
-                    {
-                        $set: {
-                            fullName: purchase.customer.fullName,
-                            phone: purchase.customer.phone,
-                            dateOfBirth: purchase.customer.dateOfBirth,
-                            membershipType: purchase.plan,
-                            membershipStartDate: startDate,
-                            expiryDate,
-                            status: member.status === "suspended"
-                                ? "suspended"
-                                : "active",
-                            updatedAt: now
-                        },
-
-                        // Add the new card token without removing
-                        // any previously issued card tokens.
-                        $addToSet: {
-                            cardAccessTokenHashes: cardTokenHash
-                        }
-                    },
-                    { session }
-                );
-
-                if (memberUpdate.matchedCount !== 1) {
-                    throw new Error("Member update failed.");
-                }
-            }
-
-            const activationUpdate = await purchases.updateOne(
-                {
-                    _id: purchase._id,
-                    paymentStatus: "paid",
-                    membershipActivationStatus: {
-                        $ne: "completed"
-                    },
-                    membershipActivatedAt: {
-                        $exists: false
-                    }
-                },
-                {
-                    $set: {
-                        memberId: member.memberId,
-                        membershipStartDate: startDate,
-                        membershipExpiryDate: expiryDate,
-                        membershipActivatedAt: now,
-                        membershipActivationStatus: "completed",
-                        updatedAt: now
-                    }
-                },
-                { session }
-            );
-
-            if (activationUpdate.modifiedCount !== 1) {
-                throw new Error(
-                    "Purchase activation could not be completed."
-                );
-            }
-
-            // Prepare the email only after all activation updates
-            // have succeeded inside the transaction.
-            membershipEmail = {
-                email: member.email,
-                fullName: member.fullName,
-                memberId: member.memberId,
-                cardToken,
-                planName: plan.name,
-                amount: purchase.amount,
-                currency: purchase.currency,
-                expiryDate,
-                isNewMember
-            };
-
-            activationResult = {
-                success: true,
-                memberId: member.memberId
-            };
-        });
-
-        // Send the email after the database transaction commits.
-        if (membershipEmail) {
-            const escapeHTML = (value) =>
-                String(value ?? "").replace(
-                    /[&<>"']/g,
-                    (character) => ({
-                        "&": "&amp;",
-                        "<": "&lt;",
-                        ">": "&gt;",
-                        '"': "&quot;",
-                        "'": "&#39;"
-                    })[character]
-                );
-
-            const cardUrl =
-                `${FRONTEND_URL}/member/${membershipEmail.cardToken}`;
-
-            const formattedAmount =
-                `${(membershipEmail.amount / 100).toFixed(2)} ${membershipEmail.currency.toUpperCase()}`;
-
-            const formattedExpiry =
-                membershipEmail.expiryDate.toDateString();
-
-            const subject = membershipEmail.isNewMember
-                ? "Welcome to DA WEB SOCIAL CLUB"
-                : "Your DA WEB SOCIAL CLUB Membership Has Been Renewed";
-
-            const heading = membershipEmail.isNewMember
-                ? "Welcome to DA WEB SOCIAL CLUB"
-                : "Membership Successfully Renewed";
-
-            const message = membershipEmail.isNewMember
-                ? "Your membership has been successfully activated."
-                : "Your payment was successful and your membership has been successfully renewed.";
-
-            try {
-                const emailResult = await resend.emails.send({
-                    from: process.env.EMAIL_FROM,
-                    to: membershipEmail.email,
-                    subject,
-
-                    html: `
-                        <div style="
-                            background:#080808;
-                            color:#ffffff;
-                            padding:35px 20px;
-                            font-family:Arial,sans-serif;
-                            text-align:center;
-                        ">
-                            <h1 style="
-                                color:#d4af37;
-                                margin-bottom:25px;
-                            ">
-                                ${heading}
-                            </h1>
-
-                            <p style="color:#dddddd;">
-                                Hello ${escapeHTML(membershipEmail.fullName)},
-                            </p>
-
-                            <p style="
-                                color:#dddddd;
-                                line-height:1.7;
-                            ">
-                                ${message}
-                            </p>
-
-                            <div style="
-                                background:#151515;
-                                border:1px solid #444;
-                                border-radius:10px;
-                                padding:25px;
-                                margin:25px auto;
-                                max-width:420px;
-                                text-align:left;
-                            ">
-                                <p>
-                                    <span style="color:#aaaaaa;">
-                                        Member ID:
-                                    </span>
-                                    <strong>
-                                        ${escapeHTML(membershipEmail.memberId)}
-                                    </strong>
-                                </p>
-
-                                <p>
-                                    <span style="color:#aaaaaa;">
-                                        Membership:
-                                    </span>
-                                    <strong style="color:#d4af37;">
-                                        ${escapeHTML(membershipEmail.planName)}
-                                    </strong>
-                                </p>
-
-                                <p>
-                                    <span style="color:#aaaaaa;">
-                                        Payment:
-                                    </span>
-                                    <strong>${escapeHTML(formattedAmount)}</strong>
-                                </p>
-
-                                <p>
-                                    <span style="color:#aaaaaa;">
-                                        Membership Expiry:
-                                    </span>
-                                    <strong>${escapeHTML(formattedExpiry)}</strong>
-                                </p>
-                            </div>
-
-                            <a
-                                href="${cardUrl}"
-                                style="
-                                    display:inline-block;
-                                    padding:14px 28px;
-                                    background:#d4af37;
-                                    color:#080808;
-                                    text-decoration:none;
-                                    font-weight:bold;
-                                    border-radius:5px;
-                                    margin-top:10px;
-                                "
-                            >
-                                VIEW YOUR MEMBERSHIP CARD
-                            </a>
-
-                            <p style="
-                                color:#888888;
-                                font-size:12px;
-                                margin-top:35px;
-                            ">
-                                DA WEB SOCIAL CLUB
-                            </p>
-                        </div>
-                    `
-                });
-
-                if (emailResult.error) {
-                    console.error(
-                        "Membership activated, but email failed:",
-                        emailResult.error
-                    );
-                } else {
-                    console.log(
-                        membershipEmail.isNewMember
-                            ? "Welcome email sent successfully."
-                            : "Renewal confirmation email sent successfully."
-                    );
-                }
-
-            } catch (emailError) {
-                console.error(
-                    "Membership activated, but email sending failed:",
-                    emailError
-                );
-            }
-        }
-
-        return activationResult;
-
-    } finally {
-        await session.endSession();
-    }
-};
-
-
-// ==========================================
-// STRIPE WEBHOOK
-// ==========================================
-
-
-app.post("/api/stripe/webhook", async (req, res) => {
-    const signature = req.headers["stripe-signature"];
-
-    if (!stripe) {
-        return res.status(503).send("Stripe is not configured.");
-    }
-
-    if (!process.env.STRIPE_WEBHOOK_SECRET) {
-        return res.status(503).send("Stripe webhook secret is missing.");
-    }
-
-    if (!req.rawBody || !signature) {
-        return res.status(400).send("Missing webhook signature or raw body.");
-    }
-
-    let event;
-
-    try {
-        event = stripe.webhooks.constructEvent(
-            req.rawBody,
-            signature,
-            process.env.STRIPE_WEBHOOK_SECRET
-        );
-    } catch (error) {
-        console.error("Stripe webhook signature error:", error.message);
-
-        return res.status(400).send("Invalid webhook signature.");
-    }
-
-    try {
-        if (
-            event.type === "checkout.session.completed" ||
-            event.type === "checkout.session.async_payment_succeeded"
-        ) {
-            const checkoutSession = event.data.object;
-
-            // Validate the Stripe Checkout Session.
-            if (
-                checkoutSession.mode !== "payment" ||
-                checkoutSession.status !== "complete"
-            ) {
-                return res.status(400).json({
-                    received: false,
-                    message: "Invalid checkout session."
-                });
-            }
-
-            if (checkoutSession.payment_status !== "paid") {
-                return res.json({
-                    received: true,
-                    message: "Payment is not completed yet."
-                });
-            }
-
-            const purchaseId = checkoutSession.metadata?.purchaseId;
-
-            if (
-                typeof purchaseId !== "string" ||
-                !ObjectId.isValid(purchaseId)
-            ) {
-                console.error("Invalid purchase ID in Stripe metadata.");
-
-                return res.status(400).json({
-                    received: false,
-                    message: "Invalid purchase reference."
-                });
-            }
-
-            const purchases = db.collection("purchases");
-
-            const purchase = await purchases.findOne({
-                _id: new ObjectId(purchaseId),
-                stripeSessionId: checkoutSession.id
-            });
-
-            if (!purchase) {
-                console.error(
-                    "Purchase not found for Stripe session:",
-                    checkoutSession.id
-                );
-
-                return res.status(404).json({
-                    received: false,
-                    message: "Purchase not found."
-                });
-            }
-
-            const plan = membershipPlans[purchase.plan];
-
-            if (
-                !plan ||
-                purchase.amount !== plan.amount ||
-                purchase.currency !== plan.currency ||
-                checkoutSession.amount_total !== purchase.amount ||
-                checkoutSession.currency !== purchase.currency
-            ) {
-                console.error(
-                    "Stripe payment details mismatch:",
-                    purchaseId
-                );
-
-                return res.status(400).json({
-                    received: false,
-                    message: "Payment amount or currency mismatch."
-                });
-            }
-
-            // Update payment status only if it is still pending.
-            await purchases.updateOne(
-                {
-                    _id: purchase._id,
-                    paymentStatus: "pending",
-                    stripeSessionId: checkoutSession.id
-                },
-                {
-                    $set: {
-                        paymentStatus: "paid",
-                        stripePaymentIntentId:
-                            typeof checkoutSession.payment_intent === "string"
-                                ? checkoutSession.payment_intent
-                                : checkoutSession.payment_intent?.id || null,
-                        paidAt: new Date(),
-                        updatedAt: new Date()
-                    }
-                }
-            );
-
-            // Fetch the latest purchase to handle duplicate webhook events.
-            const updatedPurchase = await purchases.findOne({
-                _id: purchase._id,
-                paymentStatus: "paid",
-                stripeSessionId: checkoutSession.id
-            });
-
-            if (updatedPurchase) {
-                const result = await activatePaidPurchase(purchaseId);
-
-                console.log(
-                    "Membership activation result:",
-                    result
-                );
-            }
-        }
-
-        if (event.type === "checkout.session.expired") {
-            const checkoutSession = event.data.object;
-
-            console.log(
-                "Stripe Checkout Session expired:",
-                checkoutSession.id
-            );
-
-            // Keep the purchase pending.
-            // The checkout route will detect the expired session
-            // and create a new Checkout Session when requested.
-        }
-
-        return res.json({ received: true });
-
-    } catch (error) {
-        console.error("Stripe webhook processing error:", error);
-
-        return res.status(500).json({
-            received: false,
-            message: "Webhook processing failed."
-        });
-    }
-});
-
-app.get("/api/payments/confirmation/:sessionId", async (req, res) => {
-    try {
-        if (!stripe) {
-            return res.status(503).json({
-                success: false,
-                message: "Stripe is not configured."
-            });
-        }
-
-        if (!process.env.JWT_SECRET) {
-            return res.status(503).json({
-                success: false,
-                message: "Server security configuration is missing."
-            });
-        }
-
-        const { sessionId } = req.params;
-
-        if (
-            typeof sessionId !== "string" ||
-            !/^cs_(test|live)_[A-Za-z0-9]+$/.test(sessionId)
-        ) {
-            return res.status(400).json({
-                success: false,
-                message: "Invalid checkout session ID."
-            });
-        }
-
-        // Verify the checkout session directly with Stripe.
-        const checkoutSession =
-            await stripe.checkout.sessions.retrieve(sessionId);
-
-        if (
-            checkoutSession.status !== "complete" ||
-            checkoutSession.payment_status !== "paid"
-        ) {
-            return res.status(202).json({
-                success: true,
-                status: "processing",
-                message: "Waiting for payment confirmation."
-            });
-        }
-
-        const purchase = await db.collection("purchases").findOne({
-            stripeSessionId: sessionId
-        });
-
-        if (!purchase) {
-            return res.status(404).json({
-                success: false,
-                message: "Purchase not found."
-            });
-        }
-
-        // Ensure the Stripe session belongs to this purchase.
-        if (
-            checkoutSession.metadata?.purchaseId !==
-            purchase._id.toString() ||
-            checkoutSession.amount_total !== purchase.amount ||
-            checkoutSession.currency !== purchase.currency
-        ) {
-            return res.status(400).json({
-                success: false,
-                message: "Payment details could not be verified."
-            });
-        }
-
-        // The webhook must finish activating the membership first.
-        if (
-            purchase.paymentStatus !== "paid" ||
-            (
-                purchase.membershipActivationStatus !== "completed" &&
-                !purchase.membershipActivatedAt
-            )
-        ) {
-            return res.status(202).json({
-                success: true,
-                status: "processing",
-                message: "Your membership is being activated."
-            });
-        }
-
-        const members = db.collection("members");
-
-        const member = await members.findOne({
-            memberId: purchase.memberId
-        });
-
-        if (!member) {
-            return res.status(202).json({
-                success: true,
-                status: "processing",
-                message: "Preparing your membership card."
-            });
-        }
-
-        // Generate the same secure token for this purchase every time.
-        // The raw token is never stored in MongoDB.
-        const cardToken = hashToken(
-            `payment-card:${sessionId}:${process.env.JWT_SECRET}`
-        );
-
-        const cardTokenHash = hashToken(cardToken);
-
-        // Register the token hash while preserving previous card links.
-        await members.updateOne(
-            { _id: member._id },
-            {
-                $addToSet: {
-                    cardAccessTokenHashes: cardTokenHash
-                }
-            }
-        );
-
-        const frontendUrl = FRONTEND_URL.replace(/\/+$/, "");
-
-        return res.json({
-            success: true,
-            status: "completed",
-            cardUrl: `${frontendUrl}/member/${cardToken}`
-        });
-
-    } catch (error) {
-        console.error("Payment confirmation error:", error);
-
-        return res.status(500).json({
-            success: false,
-            message: "Unable to confirm your membership yet."
-        });
-    }
-});
-
 
 // ==========================================
 // DIGITAL MEMBERSHIP CARD
@@ -2495,9 +2023,7 @@ app.get("/api/admin/members/:memberId", verifyAdmin, async (req, res) => {
                 { memberId },
                 {
                     projection: {
-                        customer: 0,
-                        stripeSessionId: 0,
-                        stripePaymentIntentId: 0
+                        customer: 0
                     }
                 }
             )
